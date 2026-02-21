@@ -1,0 +1,125 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// Color constants used by parser.go PrintSummary - empty strings = no ANSI codes
+const (
+	ColorReset  = ""
+	ColorGreen  = ""
+	ColorYellow = ""
+	ColorBlue   = ""
+	ColorCyan   = ""
+	ColorRed    = ""
+)
+
+func main() {
+	var inputFiles []string
+	for _, arg := range os.Args[1:] {
+		ext := strings.ToLower(filepath.Ext(arg))
+		if ext == ".txt" || ext == ".pdf" {
+			inputFiles = append(inputFiles, arg)
+		}
+	}
+
+	if len(inputFiles) == 0 {
+		fmt.Println("BCA Statement Converter")
+		fmt.Println("Usage: bca-converter.exe file1.pdf file2.txt ...")
+		fmt.Println("       or use START_UI.bat for the graphical interface")
+		os.Exit(1)
+	}
+
+	success := 0
+	failed := 0
+
+	for _, inputFile := range inputFiles {
+		ext := strings.ToLower(filepath.Ext(inputFile))
+
+		txtFile := inputFile
+		isTempTxt := false
+		if ext == ".pdf" {
+			fmt.Printf("Converting PDF: %s\n", filepath.Base(inputFile))
+			converted, err := pdfToTxt(inputFile)
+			if err != nil {
+				fmt.Printf("ERROR: PDF conversion failed: %v\n", err)
+				failed++
+				continue
+			}
+			txtFile = converted
+			isTempTxt = true
+			fmt.Println("Converted to TXT OK")
+		}
+
+		base := strings.TrimSuffix(inputFile, filepath.Ext(inputFile))
+		output := base + ".xlsx"
+
+		fmt.Printf("Parsing: %s\n", filepath.Base(txtFile))
+
+		parser := NewBCAParser(txtFile)
+		err := parser.Parse()
+		if err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+			cleanupTemp(isTempTxt, txtFile)
+			failed++
+			continue
+		}
+
+		parser.PrintSummary()
+
+		fmt.Println("Generating Excel...")
+		err = parser.ExportToExcel(output)
+		if err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+			cleanupTemp(isTempTxt, txtFile)
+			failed++
+			continue
+		}
+
+		cleanupTemp(isTempTxt, txtFile)
+		fmt.Printf("OK: %s\n\n", filepath.Base(output))
+		success++
+	}
+
+	fmt.Println(strings.Repeat("=", 50))
+	if failed == 0 {
+		fmt.Printf("DONE: %d converted successfully\n", success)
+	} else {
+		fmt.Printf("DONE: %d OK, %d failed\n", success, failed)
+	}
+	// No "Press Enter to exit" - the UI reads stdout and closes the process
+}
+
+func cleanupTemp(isTemp bool, path string) {
+	if isTemp {
+		os.Remove(path)
+	}
+}
+
+func pdfToTxt(pdfPath string) (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("cannot find exe path: %w", err)
+	}
+	scriptPath := filepath.Join(filepath.Dir(exePath), "pdf_to_txt.py")
+
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("pdf_to_txt.py not found - keep it in the same folder as the exe")
+	}
+
+	txtPath := strings.TrimSuffix(pdfPath, filepath.Ext(pdfPath)) + "_temp.txt"
+
+	for _, pyCmd := range []string{"python", "python3"} {
+		cmd := exec.Command(pyCmd, scriptPath, pdfPath, txtPath)
+		cmd.CombinedOutput()
+		if _, err := os.Stat(txtPath); err == nil {
+			return txtPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("Python not found - install from https://python.org then: pip install pdfplumber")
+}
