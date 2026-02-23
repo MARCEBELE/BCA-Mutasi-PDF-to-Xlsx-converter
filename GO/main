@@ -112,13 +112,47 @@ func pdfToTxt(pdfPath string) (string, error) {
 
 	txtPath := strings.TrimSuffix(pdfPath, filepath.Ext(pdfPath)) + "_temp.txt"
 
-	for _, pyCmd := range []string{"python", "python3"} {
-		cmd := exec.Command(pyCmd, scriptPath, pdfPath, txtPath)
-		cmd.CombinedOutput()
-		if _, err := os.Stat(txtPath); err == nil {
-			return txtPath, nil
+	// Check Python is actually findable before trying to run
+	var pyPath string
+	for _, pyCmd := range []string{"python", "py", "python3"} {
+		if p, err := exec.LookPath(pyCmd); err == nil {
+			pyPath = p
+			break
 		}
 	}
+	if pyPath == "" {
+		return "", fmt.Errorf("Python not found - install from https://python.org then: pip install pdfplumber")
+	}
 
-	return "", fmt.Errorf("Python not found - install from https://python.org then: pip install pdfplumber")
+	cmd := exec.Command(pyPath, scriptPath, pdfPath, txtPath)
+	// Strip PyInstaller env vars so the system Python uses its own home/stdlib,
+	// not the bundled Python 3.x runtime that BCA_Converter.exe was built with.
+	// PYTHONHOME in particular causes "Module use of pythonXXX.dll conflicts" errors.
+	blocked := map[string]bool{
+		"PYTHONHOME":        true,
+		"PYTHONPATH":        true,
+		"PYTHONSTARTUP":     true,
+		"PYTHONOPTIMIZE":    true,
+		"PYTHONDONTWRITEBYTECODE": true,
+	}
+	clean := os.Environ()[:0]
+	for _, e := range os.Environ() {
+		key := e
+		if i := strings.Index(e, "="); i >= 0 {
+			key = e[:i]
+		}
+		if !blocked[key] {
+			clean = append(clean, e)
+		}
+	}
+	cmd.Env = clean
+	out, _ := cmd.CombinedOutput()
+	if _, err := os.Stat(txtPath); err == nil {
+		return txtPath, nil
+	}
+
+	if len(out) > 0 {
+		return "", fmt.Errorf("Python script error:\n%s", strings.TrimSpace(string(out)))
+	}
+	return "", fmt.Errorf("Python ran but produced no output - check pdfplumber: pip install pdfplumber")
 }
