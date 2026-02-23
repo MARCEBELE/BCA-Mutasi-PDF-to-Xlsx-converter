@@ -4,7 +4,7 @@ echo  BCA Statement Converter - Build
 echo ================================================
 echo.
 
-echo [1/4] Building bca-converter.exe ...
+echo [1/5] Building bca-converter.exe ...
 set GOOS=windows
 set GOARCH=amd64
 go build -o bca-converter.exe .
@@ -16,8 +16,18 @@ if %errorlevel% neq 0 (
 echo   OK
 
 echo.
-echo [2/4] Installing Python packages ...
-pip install pdfplumber windnd pyinstaller --quiet
+echo [2/5] Building SETUP.exe ...
+go build -o SETUP.exe ./setup/
+if %errorlevel% neq 0 (
+    echo ERROR: SETUP.exe build failed.
+    pause
+    exit /b 1
+)
+echo   OK
+
+echo.
+echo [3/5] Installing Python packages ...
+python -m pip install pdfplumber windnd pyinstaller
 if %errorlevel% neq 0 (
     echo ERROR: pip install failed. Is Python installed? https://python.org
     pause
@@ -26,8 +36,8 @@ if %errorlevel% neq 0 (
 echo   OK
 
 echo.
-echo [3/4] Building BCA_Converter.exe ...
-pyinstaller --onefile --windowed --name "BCA_Converter" ^
+echo [4/5] Building BCA_Converter.exe ...
+python -m PyInstaller --onefile --windowed --name "BCA_Converter" ^
     --add-data "bca-converter.exe;." ^
     --add-data "pdf_to_txt.py;." ^
     --hidden-import windnd ^
@@ -39,7 +49,7 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [4/4] Finishing up ...
+echo [5/5] Finishing up ...
 if exist dist\BCA_Converter.exe (
     move /Y dist\BCA_Converter.exe BCA_Converter.exe > nul
     rmdir /S /Q dist 2>nul
@@ -49,7 +59,9 @@ if exist dist\BCA_Converter.exe (
 
 echo.
 echo ================================================
-echo  DONE - double-click BCA_Converter.exe to start
+echo  DONE
+echo  Distribute: BCA_Converter.exe + SETUP.exe
+echo  New users run SETUP.exe first, then the app.
 echo ================================================
 echo.
 pause
