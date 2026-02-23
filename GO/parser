@@ -1,0 +1,484 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Transaction struct {
+	Date        time.Time
+	Description string
+	Type        string // CR, DB, OPENING
+	Amount      float64
+	Balance     float64
+}
+
+type AccountInfo struct {
+	AccountNumber string
+	AccountHolder string
+	Period        string
+	Currency      string
+}
+
+type Summary struct {
+	OpeningBalance float64
+	TotalCredits   float64
+	CreditCount    int
+	TotalDebits    float64
+	DebitCount     int
+	ClosingBalance float64
+}
+
+type BCAParser struct {
+	Filename     string
+	AccountInfo  AccountInfo
+	Transactions []Transaction
+	Summary      Summary
+}
+
+func NewBCAParser(filename string) *BCAParser {
+	return &BCAParser{Filename: filename, Transactions: make([]Transaction, 0)}
+}
+
+func (p *BCAParser) Parse() error {
+	file, err := os.Open(p.Filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	content := strings.Join(lines, "\n")
+	p.extractAccountInfo(content, lines)
+	p.extractTransactions(lines)
+	p.extractSummary(content)
+	return nil
+}
+
+func (p *BCAParser) extractAccountInfo(content string, lines []string) {
+	re := regexp.MustCompile(`NO\.\s*REKENING\s*:\s*(\d+)`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.AccountInfo.AccountNumber = match[1]
+	}
+
+	re = regexp.MustCompile(`PERIODE\s*:\s*([A-Z]+\s+\d+)`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.AccountInfo.Period = match[1]
+	}
+
+	// In PDF-derived TXT the name appears on the same line as NO. REKENING;
+	// fall back to lines[2] for BCA's own TXT exports.
+	re = regexp.MustCompile(`(?m)^(.+?)\s+NO\.\s*REKENING\s*:`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.AccountInfo.AccountHolder = strings.TrimSpace(match[1])
+	} else if len(lines) > 2 {
+		p.AccountInfo.AccountHolder = strings.TrimSpace(lines[2])
+	}
+
+	re = regexp.MustCompile(`MATA\s+UANG\s*:\s*(\w+)`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.AccountInfo.Currency = match[1]
+	}
+}
+
+// spbuPumpCode strips the pump code from KARTU DEBIT SPBU transactions.
+// Codes like "31.117.02" contain segments that look like currency amounts.
+var spbuPumpCode = regexp.MustCompile(`(?i)(KARTU DEBIT SPBU\s+)([\d.,\-]+)`)
+
+// embeddedTxnDate matches a DD/MM token mid-line — the PDF renderer sometimes
+// merges two adjacent lines without a newline.
+var embeddedTxnDate = regexp.MustCompile(`(?:[^\s:])(\d{2}/\d{2}\s)`)
+
+// inlinePageBreak matches the page-break header blob that 2026+ BCA PDFs
+// collapse onto the last transaction line instead of separate lines.
+var inlinePageBreak = regexp.MustCompile(
+	`(?i)Bersambung ke halaman berikut\b.*?[\x{2022}\xE2\x80\xA2]\s*$`,
+)
+
+func (p *BCAParser) extractTransactions(lines []string) {
+	const sentinel = "TANGGAL KETERANGAN CBG MUTASI SALDO"
+
+	var buffer []string
+	year := p.getYearFromPeriod()
+	lastMonth := 0
+	inTransactions := false
+	inPageHeader := false
+
+	datePattern := regexp.MustCompile(`^\d{2}/\d{2}\s`)
+	monthCapture := regexp.MustCompile(`^\d{2}/(\d{2})`)
+
+	flushBuffer := func() {
+		if len(buffer) == 0 {
+			return
+		}
+		// Increment year when month resets Dec→Jan across statement batches.
+		if m := monthCapture.FindStringSubmatch(buffer[0]); len(m) > 1 {
+			month, _ := strconv.Atoi(m[1])
+			if lastMonth == 12 && month == 1 {
+				year++
+			}
+			if month > 0 {
+				lastMonth = month
+			}
+		}
+		p.processTransactionBuffer(buffer, year)
+		buffer = nil
+	}
+
+	for _, rawLine := range lines {
+		rawLine = inlinePageBreak.ReplaceAllString(rawLine, "")
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		if strings.Contains(line, "Bersambung ke halaman berikut") {
+			inPageHeader = true
+			continue
+		}
+		if inPageHeader {
+			if !strings.Contains(line, sentinel) {
+				continue
+			}
+			// Fall through to sentinel handling below.
+		}
+
+		if strings.Contains(line, sentinel) {
+			inPageHeader = false
+			flushBuffer()
+			inTransactions = true
+			continue
+		}
+
+		if !inTransactions {
+			continue
+		}
+
+		if p.isSummaryLine(line) {
+			flushBuffer()
+			inTransactions = false
+			continue
+		}
+
+		if pageNumberPattern.MatchString(line) {
+			continue
+		}
+
+		if datePattern.MatchString(line) {
+			flushBuffer()
+			buffer = append(buffer, line)
+			continue
+		}
+
+		if len(buffer) > 0 {
+			// Split on embedded date artefacts (two PDF lines merged without newline).
+			if loc := embeddedTxnDate.FindStringIndex(line); loc != nil {
+				splitAt := loc[0] + 1
+				prefix := strings.TrimSpace(line[:splitAt])
+				newStart := strings.TrimSpace(line[splitAt:])
+				if prefix != "" {
+					buffer = append(buffer, prefix)
+				}
+				flushBuffer()
+				buffer = []string{newStart}
+			} else {
+				buffer = append(buffer, line)
+			}
+		}
+		// Lines between sentinel and first date line are ignored.
+	}
+
+	flushBuffer()
+}
+
+// Requires a slash so bare integers (branch codes) aren't matched.
+var pageNumberPattern = regexp.MustCompile(`^\d+\s*/\s*\d*$`)
+
+func (p *BCAParser) isSummaryLine(line string) bool {
+	return strings.HasPrefix(line, "SALDO AWAL :") ||
+		strings.HasPrefix(line, "MUTASI CR :") ||
+		strings.HasPrefix(line, "MUTASI DB :") ||
+		strings.HasPrefix(line, "SALDO AKHIR :")
+}
+
+// Bare echo lines: "331000.00" — BCA reference duplicates with no commas.
+var echoLinePattern = regexp.MustCompile(`^\d+\.\d{2}$`)
+
+// Back-reference lines: "TANGGAL :07/03 110000.00" — metadata, not a transaction.
+var tanggalEchoPattern = regexp.MustCompile(`^TANGGAL\s*:\d{2}/\d{2}\s+\d+\.\d{2}$`)
+
+func isEchoLine(line string) bool {
+	return echoLinePattern.MatchString(line) || tanggalEchoPattern.MatchString(line)
+}
+
+var crWordPattern = regexp.MustCompile(`(?:^|\W)CR(?:\W|$)`)
+var dbWordPattern = regexp.MustCompile(`(?:^|\W)DB(?:\W|$)`)
+
+// detectType checks buffer[0] first to avoid false positives from merchant names
+// on continuation lines (e.g. "MALAKA CRN"). Falls back to fullText word-boundary scan.
+// Priority: date line keywords → KR INTERCHANGE → word-boundary scan.
+func detectType(dateLine, fullText string) string {
+	hasCRInLine := strings.Contains(dateLine, " CR") || strings.HasSuffix(dateLine, "CR")
+	hasDBInLine := strings.Contains(dateLine, " DB") || strings.HasSuffix(dateLine, "DB")
+
+	if hasCRInLine || strings.Contains(dateLine, "TRANSFER DR") {
+		return "CR"
+	}
+	if hasDBInLine ||
+		strings.Contains(dateLine, "TRANSFER KE") ||
+		strings.Contains(dateLine, "TARIKAN ATM") ||
+		strings.Contains(dateLine, "TRANSAKSI DEBIT") ||
+		strings.Contains(dateLine, "DEBIT DOMESTIK") {
+		return "DB"
+	}
+	if strings.Contains(fullText, "KR INTERCHANGE") {
+		return "CR"
+	}
+	// DB before CR: merchant names contain "CR" abbreviations more often than "DB".
+	if dbWordPattern.MatchString(fullText) {
+		return "DB"
+	}
+	if crWordPattern.MatchString(fullText) {
+		return "CR"
+	}
+	return ""
+}
+
+func (p *BCAParser) processTransactionBuffer(buffer []string, year int) {
+	if len(buffer) == 0 {
+		return
+	}
+
+	// Drop echo lines; strip QR zero-prefix (e.g. "00000.00TIX ID" → "TIX ID").
+	filteredBuffer := []string{buffer[0]}
+	qrZeroPrefix := regexp.MustCompile(`^0+\.00(.+)$`)
+	for _, l := range buffer[1:] {
+		if isEchoLine(l) {
+			continue
+		}
+		if m := qrZeroPrefix.FindStringSubmatch(l); m != nil {
+			l = strings.TrimSpace(m[1])
+		}
+		if l != "" {
+			filteredBuffer = append(filteredBuffer, l)
+		}
+	}
+
+	fullText := strings.Join(filteredBuffer, " ")
+
+	// Strip SPBU pump codes; multi-segment codes like "31.117.02" look like amounts.
+	if strings.Contains(fullText, "KARTU DEBIT SPBU") {
+		fullText = spbuPumpCode.ReplaceAllString(fullText, "${1}")
+	}
+
+	datePattern := regexp.MustCompile(`^(\d{2}/\d{2})`)
+	dateMatch := datePattern.FindStringSubmatch(buffer[0])
+	if len(dateMatch) < 2 {
+		return
+	}
+
+	txnDate := p.parseDate(dateMatch[1], year)
+	if txnDate.IsZero() {
+		return
+	}
+
+	txn := Transaction{Date: txnDate}
+
+	if strings.Contains(fullText, "SALDO AWAL") {
+		txn.Description = "SALDO AWAL"
+		txn.Type = "OPENING"
+		amounts := p.extractAmounts(fullText)
+		if len(amounts) > 0 {
+			txn.Balance = amounts[0] // Amount stays 0 so SUM formulas exclude opening balance.
+		}
+		p.Transactions = append(p.Transactions, txn)
+		return
+	}
+
+	if strings.Contains(fullText, "BUNGA") && !strings.Contains(fullText, "PAJAK") {
+		txn.Description = "BUNGA (Interest)"
+		txn.Type = "CR"
+		amounts := p.extractAmounts(fullText)
+		if len(amounts) >= 1 { txn.Amount = amounts[0] }
+		if len(amounts) >= 2 { txn.Balance = amounts[1] }
+		p.Transactions = append(p.Transactions, txn)
+		return
+	}
+
+	if strings.Contains(fullText, "PAJAK BUNGA") {
+		txn.Description = "PAJAK BUNGA (Tax on Interest)"
+		txn.Type = "DB"
+		amounts := p.extractAmounts(fullText)
+		if len(amounts) >= 1 { txn.Amount = amounts[0] }
+		if len(amounts) >= 2 { txn.Balance = amounts[1] }
+		p.Transactions = append(p.Transactions, txn)
+		return
+	}
+
+	if strings.Contains(fullText, "BIAYA ADM") {
+		txn.Description = "BIAYA ADM (Admin Fee)"
+		txn.Type = "DB"
+		amounts := p.extractAmounts(fullText)
+		if len(amounts) >= 1 { txn.Amount = amounts[0] }
+		if len(amounts) >= 2 { txn.Balance = amounts[1] }
+		p.Transactions = append(p.Transactions, txn)
+		return
+	}
+
+	txn.Type = detectType(buffer[0], fullText)
+
+	description := fullText
+	description = regexp.MustCompile(`^\d{2}/\d{2}\s*`).ReplaceAllString(description, "")
+	amounts := p.extractAmounts(description)
+	for _, amountStr := range p.extractAmountStrings(description) {
+		description = strings.ReplaceAll(description, amountStr, "")
+	}
+	// Strip standalone DB/CR tokens — leave substrings like "QRC014" intact.
+	dbcrMarker := regexp.MustCompile(`\b(DB|CR)\b`)
+	description = dbcrMarker.ReplaceAllString(description, "")
+	description = regexp.MustCompile(`\s+`).ReplaceAllString(description, " ")
+	txn.Description = strings.TrimSpace(description)
+
+	if len(amounts) >= 2 {
+		txn.Amount = amounts[len(amounts)-2]
+		txn.Balance = amounts[len(amounts)-1]
+	} else if len(amounts) == 1 {
+		txn.Amount = amounts[0]
+	}
+
+	if txn.Description != "" {
+		p.Transactions = append(p.Transactions, txn)
+	}
+}
+
+func (p *BCAParser) parseDate(dateStr string, year int) time.Time {
+	parts := strings.Split(dateStr, "/")
+	if len(parts) != 2 {
+		return time.Time{}
+	}
+	day, err1 := strconv.Atoi(parts[0])
+	month, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return time.Time{}
+	}
+	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+}
+
+func (p *BCAParser) extractAmounts(text string) []float64 {
+	var amounts []float64
+	// (?:\D|$) prevents matching digits inside SPBU codes like "34.15147".
+	pattern := regexp.MustCompile(`([\d,]+\.\d{2})(?:\D|$)`)
+	for _, match := range pattern.FindAllString(text, -1) {
+		trimmed := regexp.MustCompile(`[\d,]+\.\d{2}`).FindString(match)
+		if trimmed == "" {
+			continue
+		}
+		if amount := p.parseAmount(trimmed); amount > 0 {
+			amounts = append(amounts, amount)
+		}
+	}
+	return amounts
+}
+
+func (p *BCAParser) extractAmountStrings(text string) []string {
+	outer := regexp.MustCompile(`([\d,]+\.\d{2})(?:\D|$)`)
+	inner := regexp.MustCompile(`[\d,]+\.\d{2}`)
+	var result []string
+	for _, m := range outer.FindAllString(text, -1) {
+		if s := inner.FindString(m); s != "" {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func (p *BCAParser) parseAmount(amountStr string) float64 {
+	cleaned := strings.ReplaceAll(amountStr, ",", "")
+	amount, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		return 0.0
+	}
+	return amount
+}
+
+func (p *BCAParser) getYearFromPeriod() int {
+	pattern := regexp.MustCompile(`\d{4}`)
+	if match := pattern.FindString(p.AccountInfo.Period); match != "" {
+		if year, err := strconv.Atoi(match); err == nil {
+			return year
+		}
+	}
+	return time.Now().Year()
+}
+
+func (p *BCAParser) extractSummary(content string) {
+	re := regexp.MustCompile(`SALDO AWAL\s*:\s*([\d,]+\.\d{2})`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.Summary.OpeningBalance = p.parseAmount(match[1])
+	}
+	re = regexp.MustCompile(`MUTASI CR\s*:\s*([\d,]+\.\d{2})\s+(\d+)`)
+	if match := re.FindStringSubmatch(content); len(match) > 2 {
+		p.Summary.TotalCredits = p.parseAmount(match[1])
+		count, _ := strconv.Atoi(match[2])
+		p.Summary.CreditCount = count
+	}
+	re = regexp.MustCompile(`MUTASI DB\s*:\s*([\d,]+\.\d{2})\s+(\d+)`)
+	if match := re.FindStringSubmatch(content); len(match) > 2 {
+		p.Summary.TotalDebits = p.parseAmount(match[1])
+		count, _ := strconv.Atoi(match[2])
+		p.Summary.DebitCount = count
+	}
+	re = regexp.MustCompile(`SALDO AKHIR\s*:\s*([\d,]+\.\d{2})`)
+	if match := re.FindStringSubmatch(content); len(match) > 1 {
+		p.Summary.ClosingBalance = p.parseAmount(match[1])
+	}
+}
+
+func (p *BCAParser) PrintSummary() {
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Printf("%sACCOUNT INFORMATION%s\n", ColorBlue, ColorReset)
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Printf("  Account Number : %s\n", p.AccountInfo.AccountNumber)
+	fmt.Printf("  Account Holder : %s\n", p.AccountInfo.AccountHolder)
+	fmt.Printf("  Period         : %s\n", p.AccountInfo.Period)
+	fmt.Printf("  Currency       : %s\n", p.AccountInfo.Currency)
+
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Printf("%sTRANSACTION SUMMARY%s\n", ColorBlue, ColorReset)
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Printf("  Total Transactions : %d\n", len(p.Transactions))
+	fmt.Printf("  Opening Balance    : %s %s\n", p.AccountInfo.Currency, formatMoney(p.Summary.OpeningBalance))
+	fmt.Printf("  Total Credits      : %s %s (%d transactions)\n",
+		p.AccountInfo.Currency, formatMoney(p.Summary.TotalCredits), p.Summary.CreditCount)
+	fmt.Printf("  Total Debits       : %s %s (%d transactions)\n",
+		p.AccountInfo.Currency, formatMoney(p.Summary.TotalDebits), p.Summary.DebitCount)
+	fmt.Printf("  Closing Balance    : %s %s\n", p.AccountInfo.Currency, formatMoney(p.Summary.ClosingBalance))
+	fmt.Println(strings.Repeat("=", 70))
+}
+
+func formatMoney(amount float64) string {
+	s := fmt.Sprintf("%.2f", amount)
+	parts := strings.Split(s, ".")
+	intPart := parts[0]
+	result := ""
+	for i, c := range intPart {
+		if i > 0 && (len(intPart)-i)%3 == 0 {
+			result += ","
+		}
+		result += string(c)
+	}
+	return result + "." + parts[1]
+}
