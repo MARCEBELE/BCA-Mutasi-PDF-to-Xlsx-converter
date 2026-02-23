@@ -1,5 +1,13 @@
 import sys
 import os
+
+# Must run before any other import.
+# When this script is inside a PyInstaller _MEI* temp dir, Python adds that dir
+# to sys.path[0]. That dir contains Python 3.x .pyd files (e.g. unicodedata.pyd)
+# which conflict with the system Python's own stdlib. Strip it out immediately.
+if sys.path and os.path.basename(os.path.normpath(sys.path[0])).startswith("_MEI"):
+    sys.path = sys.path[1:]
+
 import re
 
 # Fallback column x-boundaries (points) — overridden at runtime from sentinel row.
@@ -162,6 +170,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python pdf_to_txt.py input.pdf [output.txt]")
         sys.exit(1)
+
     pdf_path = sys.argv[1]
     txt_path = sys.argv[2] if len(sys.argv) > 2 else None
     result = convert(pdf_path, txt_path)
