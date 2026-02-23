@@ -1,0 +1,229 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+const bar = "────────────────────────────────────────────────────────"
+
+// winget package IDs to try, newest first.
+var wingetIDs = []string{
+	"Python.Python.3.13",
+	"Python.Python.3.12",
+	"Python.Python.3.11",
+}
+
+// Direct download URL + silent install args as fallback when winget fails.
+// Update the URL when a newer Python release is available.
+const pythonInstallerURL = "https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe"
+
+func main() {
+	fmt.Println()
+	fmt.Println("  BCA Statement Converter — Setup")
+	fmt.Println(bar)
+	fmt.Println()
+
+	// ── Step 1: Find Python ─────────────────────────────────────────────────
+	fmt.Print("  [1/2] Checking for Python... ")
+	pyPath, pyVer := findPython()
+
+	if pyPath != "" {
+		fmt.Printf("found (%s)\n", pyVer)
+	} else {
+		fmt.Println("not found")
+		fmt.Println()
+
+		installed := tryWinget() || tryDirectDownload()
+
+		if installed {
+			fmt.Println()
+			fmt.Println("        Waiting for installation to settle...")
+			time.Sleep(4 * time.Second)
+			pyPath, pyVer = findPython()
+			if pyPath == "" {
+				pyPath = scanCommonPaths()
+			}
+			if pyPath != "" {
+				fmt.Printf("        Python ready: %s\n", pyPath)
+			}
+		}
+
+		if pyPath == "" {
+			fmt.Println()
+			fmt.Println("  [!] Could not auto-install Python.")
+			fmt.Println()
+			fmt.Println("      Please install it manually:")
+			fmt.Println("      1. Open  https://python.org/downloads/")
+			fmt.Println("      2. Download the latest Python 3 Windows installer")
+			fmt.Println("      3. Run the installer")
+			fmt.Println("      4. IMPORTANT: tick the box  'Add Python to PATH'")
+			fmt.Println("      5. After install finishes, run this SETUP.exe again")
+			pause()
+			os.Exit(1)
+		}
+	}
+
+	// ── Step 2: Install pdfplumber ──────────────────────────────────────────
+	fmt.Println()
+	fmt.Print("  [2/2] Installing pdfplumber... ")
+	out, err := exec.Command(pyPath, "-m", "pip", "install", "--upgrade", "pdfplumber").CombinedOutput()
+	if err != nil {
+		fmt.Println("FAILED")
+		fmt.Println()
+		fmt.Printf("  Error output:\n%s\n", indent(strings.TrimSpace(string(out)), "      "))
+		fmt.Println()
+		fmt.Println("  You can try running this command yourself:")
+		fmt.Printf("      %s -m pip install pdfplumber\n", pyPath)
+		pause()
+		os.Exit(1)
+	}
+	fmt.Println("done")
+
+	// ── Done ────────────────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println(bar)
+	fmt.Println("  All done!  You can now double-click BCA_Converter.exe to start.")
+	fmt.Println(bar)
+	pause()
+}
+
+// tryWinget tries each versioned Python package ID until one succeeds.
+func tryWinget() bool {
+	if _, err := exec.LookPath("winget"); err != nil {
+		fmt.Println("        winget not available — trying direct download instead...")
+		return false
+	}
+	fmt.Println("        Trying to install Python via winget...")
+	fmt.Println()
+	for _, id := range wingetIDs {
+		fmt.Printf("        Trying package: %s\n", id)
+		cmd := exec.Command(
+			"winget", "install",
+			"--id", id,
+			"--silent",
+			"--accept-source-agreements",
+			"--accept-package-agreements",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if cmd.Run() == nil {
+			return true
+		}
+	}
+	fmt.Println()
+	fmt.Println("        winget could not install Python — trying direct download...")
+	return false
+}
+
+// tryDirectDownload downloads the Python installer using PowerShell and runs it silently.
+func tryDirectDownload() bool {
+	fmt.Println()
+	fmt.Println("        Downloading Python installer from python.org...")
+	fmt.Printf("        URL: %s\n", pythonInstallerURL)
+	fmt.Println()
+
+	tmpExe := filepath.Join(os.TempDir(), "python_setup.exe")
+
+	// Use PowerShell's Invoke-WebRequest (built into every Windows 10/11 machine)
+	dlCmd := exec.Command(
+		"powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(
+			"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "+
+				"Invoke-WebRequest -Uri '%s' -OutFile '%s'",
+			pythonInstallerURL, tmpExe,
+		),
+	)
+	dlCmd.Stdout = os.Stdout
+	dlCmd.Stderr = os.Stderr
+	if err := dlCmd.Run(); err != nil {
+		fmt.Println("        Download failed — no internet access or PowerShell blocked.")
+		return false
+	}
+
+	fmt.Println("        Running installer silently (this may take a minute)...")
+	installCmd := exec.Command(
+		tmpExe,
+		"/quiet",
+		"InstallAllUsers=0",
+		"PrependPath=1",
+		"Include_test=0",
+		"Include_launcher=1",
+	)
+	installCmd.Stdout = os.Stdout
+	installCmd.Stderr = os.Stderr
+	if err := installCmd.Run(); err != nil {
+		fmt.Println("        Installer failed — try running it manually.")
+		os.Remove(tmpExe)
+		return false
+	}
+
+	os.Remove(tmpExe)
+	return true
+}
+
+// findPython tries common Python command names and returns (executablePath, version string).
+func findPython() (string, string) {
+	for _, cmd := range []string{"python", "py", "python3"} {
+		out, err := exec.Command(cmd, "--version").Output()
+		if err != nil {
+			continue
+		}
+		ver := strings.TrimSpace(string(out))
+		p, _ := exec.LookPath(cmd)
+		return p, ver
+	}
+	return "", ""
+}
+
+// scanCommonPaths looks for python.exe in the default install locations in case
+// PATH hasn't refreshed in the current process yet after a fresh install.
+func scanCommonPaths() string {
+	localApp := os.Getenv("LOCALAPPDATA")
+	progFiles := os.Getenv("ProgramFiles")
+	progFilesX86 := os.Getenv("ProgramFiles(x86)")
+
+	roots := []string{
+		filepath.Join(localApp, "Programs", "Python"),
+		filepath.Join(progFiles, "Python"),
+		filepath.Join(progFilesX86, "Python"),
+	}
+
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		// Walk in reverse so we pick the highest version (e.g. Python313 > Python311)
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "Python3") {
+				continue
+			}
+			candidate := filepath.Join(root, e.Name(), "python.exe")
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+func pause() {
+	fmt.Println()
+	fmt.Print("  Press Enter to exit...")
+	var b [1]byte
+	os.Stdin.Read(b[:])
+}
