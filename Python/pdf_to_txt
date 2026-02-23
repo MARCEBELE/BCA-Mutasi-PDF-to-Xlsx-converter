@@ -1,0 +1,168 @@
+import sys
+import os
+import re
+
+# Fallback column x-boundaries (points) — overridden at runtime from sentinel row.
+_X_DATE_MAX_DEFAULT   = 82
+_X_MUTASI_MIN_DEFAULT = 370
+_X_SALDO_MIN_DEFAULT  = 490
+
+SENTINEL       = "TANGGAL KETERANGAN CBG MUTASI SALDO"
+SUMMARY_STARTS = ("SALDO AWAL", "MUTASI CR", "MUTASI DB", "SALDO AKHIR")
+
+
+def _detect_column_boundaries(sentinel_row_words):
+    col_x = {}
+    for w in sentinel_row_words:
+        t = w['text'].upper()
+        if t == 'KETERANGAN': col_x['KETERANGAN'] = w['x0']
+        elif t == 'MUTASI':   col_x['MUTASI']      = w['x0']
+        elif t == 'SALDO':    col_x['SALDO']        = w['x0']
+    if len(col_x) < 3:
+        return None
+    return col_x['KETERANGAN'], col_x['MUTASI'], col_x['SALDO']
+
+
+def _extract_words(pdf_path):
+    try:
+        import pdfplumber
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "pdfplumber", "--quiet"])
+        import pdfplumber
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            yield page.extract_words(keep_blank_chars=False)
+
+
+def pdf_to_lines(pdf_path):
+    all_lines  = []
+    x_date_max   = _X_DATE_MAX_DEFAULT
+    x_mutasi_min = _X_MUTASI_MIN_DEFAULT
+    x_saldo_min  = _X_SALDO_MIN_DEFAULT
+    cols_detected = False
+    first_page    = True
+
+    for page_words in _extract_words(pdf_path):
+        if not page_words:
+            continue
+
+        rows = {}
+        for w in page_words:
+            key = round(w['top'] / 2) * 2
+            rows.setdefault(key, []).append(w)
+        sorted_keys = sorted(rows.keys())
+
+        # Emit account-info header rows (NO. REKENING, PERIODE, MATA UANG)
+        # so parser.go can populate AccountInfo from PDF-derived TXT.
+        if first_page:
+            for top_key in sorted_keys:
+                row_words = sorted(rows[top_key], key=lambda w: w['x0'])
+                texts     = [w['text'] for w in row_words]
+                full_text = ' '.join(texts)
+                if 'TANGGAL' in texts and 'SALDO' in texts and 'CBG' in texts:
+                    break
+                if any(kw in full_text for kw in ('NO. REKENING', 'PERIODE :', 'MATA UANG')):
+                    all_lines.append(full_text)
+            first_page = False
+
+        in_table   = False
+        page_lines = []
+
+        for top_key in sorted_keys:
+            row_words = sorted(rows[top_key], key=lambda w: w['x0'])
+            texts     = [w['text'] for w in row_words]
+            full_text = ' '.join(texts)
+
+            if 'TANGGAL' in texts and 'SALDO' in texts and 'CBG' in texts:
+                in_table = True
+                page_lines.append(SENTINEL)
+                if not cols_detected:
+                    detected = _detect_column_boundaries(row_words)
+                    if detected:
+                        x_date_max, x_mutasi_min, x_saldo_min = detected
+                        cols_detected = True
+                continue
+
+            if 'Bersambung' in full_text:
+                if in_table:
+                    page_lines.append("Bersambung ke halaman berikut")
+                continue
+
+            if not in_table:
+                continue
+
+            if any(full_text.startswith(s) for s in SUMMARY_STARTS):
+                page_lines.append(full_text)
+                continue
+
+            if re.match(r'^\d+\s*/\s*\d+$', full_text.strip()):
+                continue
+
+            # Classify words by x-position into column zones.
+            # TANGGAL (date): x0 < x_date_max
+            date_words = [w for w in row_words if w['x0'] < x_date_max]
+
+            # KETERANGAN+CBG (description): x_date_max ≤ x0 < x_mutasi_min.
+            # DB/CR keywords are kept here so parser.go detectType finds them on buf[0].
+            desc_words = [w for w in row_words
+                          if x_date_max <= w['x0'] < x_mutasi_min]
+
+            # MUTASI: comma-formatted amounts only
+            mutasi_words = [w for w in row_words
+                            if w['x0'] >= x_mutasi_min and w['x0'] < x_saldo_min
+                            and re.match(r'[\d,]+\.\d{2}', w['text'])]
+
+            # DB/CR type marker
+            dbcr_words = [w for w in row_words
+                          if w['x0'] >= x_mutasi_min and w['x0'] < x_saldo_min
+                          and w['text'] in ('DB', 'CR')]
+
+            # SALDO
+            saldo_words = [w for w in row_words if w['x0'] >= x_saldo_min]
+
+            date_str   = ' '.join(w['text'] for w in date_words)
+            desc_str   = ' '.join(w['text'] for w in desc_words)
+            mutasi_str = ' '.join(w['text'] for w in mutasi_words)
+            dbcr_str   = ' '.join(w['text'] for w in dbcr_words)
+            saldo_str  = ' '.join(w['text'] for w in saldo_words)
+
+            if date_str:
+                parts = [date_str]
+                if desc_str:   parts.append(desc_str)
+                if mutasi_str: parts.append(mutasi_str)
+                if dbcr_str:   parts.append(dbcr_str)
+                if saldo_str:  parts.append(saldo_str)
+                page_lines.append(' '.join(parts))
+            else:
+                parts = []
+                if desc_str:   parts.append(desc_str)
+                if mutasi_str: parts.append(mutasi_str)
+                if dbcr_str:   parts.append(dbcr_str)
+                if saldo_str:  parts.append(saldo_str)
+                if parts:
+                    page_lines.append(' '.join(parts))
+
+        all_lines.extend(page_lines)
+
+    return all_lines
+
+
+def convert(pdf_path, txt_path=None):
+    if txt_path is None:
+        txt_path = os.path.splitext(pdf_path)[0] + ".txt"
+    lines = pdf_to_lines(pdf_path)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return txt_path
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python pdf_to_txt.py input.pdf [output.txt]")
+        sys.exit(1)
+    pdf_path = sys.argv[1]
+    txt_path = sys.argv[2] if len(sys.argv) > 2 else None
+    result = convert(pdf_path, txt_path)
+    print(result)  # stdout → Go reads this path
